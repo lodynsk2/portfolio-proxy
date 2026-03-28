@@ -8,10 +8,26 @@ export default async function handler(req, res) {
     return;
   }
 
-  const url = "https://api.stlouisfed.org/fred/series/observations?series_id=T10Y2Y&api_key=" + key + "&sort_order=desc&limit=1&file_type=json";
+  const series = [
+    "BAMLH0A0HYM2",
+    "BAMLC0A0CM",
+    "T10Y2Y",
+    "FEDFUNDS",
+    "NFCI",
+    "SAHMREALTIME",
+    "CPIAUCSL",
+    "T10YIE"
+  ];
 
-  const r = await fetch(url);
-  const json = await r.json();
+  const results = {};
 
-  res.status(200).json({ test: "ok", data: json });
+  for (const id of series) {
+    const url = "https://api.stlouisfed.org/fred/series/observations?series_id=" + id + "&api_key=" + key + "&sort_order=desc&limit=1&file_type=json";
+    const r = await fetch(url);
+    const json = await r.json();
+    const val = json.observations && json.observations[0] ? json.observations[0].value : null;
+    results[id] = val === "." ? null : val;
+  }
+
+  res.status(200).json(results);
 }
