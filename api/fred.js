@@ -8,7 +8,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  const series = [
+const series = [
     "BAMLH0A0HYM2",
     "BAMLC0A0CM",
     "T10Y2Y",
@@ -16,7 +16,11 @@ export default async function handler(req, res) {
     "NFCI",
     "SAHMREALTIME",
     "CPIAUCSL",
-    "T10YIE"
+    "T10YIE",
+    "WALCL",
+    "ECBASSETSW",
+    "JPNASSETS",
+    "CHASSETS"
   ];
 
   const results = {};
