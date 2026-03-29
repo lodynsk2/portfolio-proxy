@@ -28,11 +28,24 @@ const series = [
   const results = {};
 
   for (const id of series) {
-    const url = "https://api.stlouisfed.org/fred/series/observations?series_id=" + id + "&api_key=" + key + "&sort_order=desc&limit=1&file_type=json";
+    const url = "https://api.stlouisfed.org/fred/series/observations?series_id=" + id + "&api_key=" + key + "&sort_order=desc&limit=2&file_type=json";
     const r = await fetch(url);
     const json = await r.json();
-    const val = json.observations && json.observations[0] ? json.observations[0].value : null;
-    results[id] = val === "." ? null : val;
+   const obs = json.observations || [];
+const val = obs[0]?.value;
+// For GDP, also return previous value to calculate trend
+if (id === "GDPC1" && obs[1]) {
+  results["GDPC1_PREV"] = obs[1].value === "." ? null : obs[1].value;
+}
+// For CPI, also return previous value
+if (id === "CPIAUCSL" && obs[1]) {
+  results["CPI_PREV"] = obs[1].value === "." ? null : obs[1].value;
+}
+// For FEDFUNDS, also return previous value
+if (id === "FEDFUNDS" && obs[1]) {
+  results["FEDFUNDS_PREV"] = obs[1].value === "." ? null : obs[1].value;
+}
+results[id] = val === "." ? null : val;
   }
 
   res.status(200).json(results);
