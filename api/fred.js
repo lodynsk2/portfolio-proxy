@@ -9,7 +9,7 @@ export default async function handler(req, res) {
   }
 
 const series = [
-    "BAMLH0A0HYM2",
+        "BAMLH0A0HYM2",
     "BAMLC0A0CM",
     "T10Y2Y",
     "FEDFUNDS",
@@ -20,7 +20,9 @@ const series = [
     "WALCL",
     "ECBASSETSW",
     "JPNASSETS",
-    "CHASSETS"
+    "CHASSETS",
+    "GDPC1",
+    "UNRATE"
   ];
 
   const results = {};
