@@ -22,7 +22,10 @@ const series = [
     "JPNASSETS",
     "CHASSETS",
     "GDPC1",
-    "UNRATE"
+    "UNRATE,"
+    "M2SL",      // US M2 Money Supply
+   "MMNRNJ"     // ISM Manufacturing PMI
+  
   ];
 
   const results = {};
