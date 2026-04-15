@@ -32,34 +32,12 @@ export default async function handler(req, res) {
       .map(o => ({ date: o.date, value: parseFloat(o.value) }));
   }
 
-  async function fetchYahoo(symbol) {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=10y&interval=1mo`;
-    const r = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" }
-    });
-    if (!r.ok) throw new Error(`Yahoo ${symbol} HTTP ${r.status}`);
-    const j = await r.json();
-    const result = j.chart?.result?.[0];
-    if (!result) return [];
-    const timestamps = result.timestamp || [];
-    const closes = result.indicators?.quote?.[0]?.close || [];
-    const out = [];
-    for (let i = 0; i < timestamps.length; i++) {
-      if (closes[i] == null) continue;
-      out.push({
-        date: new Date(timestamps[i] * 1000).toISOString().slice(0, 10),
-        value: closes[i]
-      });
-    }
-    return out;
-  }
-
   try {
     const [fed, ecb, boj, sp500] = await Promise.all([
       fetchFred("WALCL").catch(e => ({ error: e.message })),
       fetchFred("ECBASSETSW").catch(e => ({ error: e.message })),
       fetchFred("JPNASSETS").catch(e => ({ error: e.message })),
-      fetchYahoo("%5EGSPC").catch(e => ({ error: e.message })),
+      fetchFred("SP500").catch(e => ({ error: e.message })),
     ]);
 
     // Normalize all series to USD trillions
