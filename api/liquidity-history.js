@@ -65,10 +65,10 @@ export default async function handler(req, res) {
     // Normalize all series to USD trillions
     // WALCL is in $M → divide by 1,000,000 to get $T
     // ECBASSETSW is in €M → divide by 1,000,000 and multiply by ~1.08 EUR/USD avg
-    // BOJTOTASSETS is in ¥100M → multiply by 100, then convert ¥→$ (~0.0067), divide by 1e12
+    // BOJTOTASSETS is in ¥100M (hundred-million yen, "億") → × 1e8 to get yen, × 0.0067 USD/JPY, ÷ 1e12 for trillions = × 6.7e-7
     const fedT = Array.isArray(fed) ? fed.map(d => ({ date: d.date, value: +(d.value / 1_000_000).toFixed(3) })) : [];
     const ecbT = Array.isArray(ecb) ? ecb.map(d => ({ date: d.date, value: +(d.value / 1_000_000 * 1.08).toFixed(3) })) : [];
-    const bojT = Array.isArray(boj) ? boj.map(d => ({ date: d.date, value: +(d.value * 100 * 0.0067 / 1_000_000_000_000).toFixed(3) })) : [];
+    const bojT = Array.isArray(boj) ? boj.map(d => ({ date: d.date, value: +(d.value * 0.00000067).toFixed(3) })) : [];
     const spx = Array.isArray(sp500) ? sp500.map(d => ({ date: d.date, value: +d.value.toFixed(2) })) : [];
 
     res.setHeader("Cache-Control", "s-maxage=3600, stale-while-revalidate");
