@@ -2,7 +2,7 @@
 // Fetches historical central bank balance sheet data + S&P 500 for overlay
 // WALCL = Fed total assets ($M, weekly)
 // ECBASSETSW = ECB total assets (€M, weekly)
-// BOJTOTASSETS = Bank of Japan total assets (¥100M, monthly)
+// JPNASSETS = Bank of Japan total assets (¥100M, monthly)
 // ^GSPC = S&P 500 (daily)
 // PBoC doesn't have a clean FRED series, so we approximate using CHNGDPNQDSMEI or leave out.
 
@@ -58,7 +58,7 @@ export default async function handler(req, res) {
     const [fed, ecb, boj, sp500] = await Promise.all([
       fetchFred("WALCL").catch(e => ({ error: e.message })),
       fetchFred("ECBASSETSW").catch(e => ({ error: e.message })),
-      fetchFred("BOJTOTASSETS").catch(e => ({ error: e.message })),
+      fetchFred("JPNASSETS").catch(e => ({ error: e.message })),
       fetchYahoo("%5EGSPC").catch(e => ({ error: e.message })),
     ]);
 
