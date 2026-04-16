@@ -1,40 +1,82 @@
+// File path in your portfolio-proxy-ja56 repo: api/feargreed.js
+// Fetches both CNN Fear & Greed Index and Alternative.me Crypto Fear & Greed Index
+// CNN: scrapes the public JSON endpoint at production.dataviz.cnn.io
+// Crypto: uses Alternative.me public API
+// Returns: { cnnScore, cnnLabel, cryptoScore, cryptoLabel, timestamp, sources }
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET");
 
-  const results = {};
+  function labelFor(score) {
+    if (score == null) return null;
+    if (score <= 25) return "Extreme Fear";
+    if (score <= 44) return "Fear";
+    if (score <= 55) return "Neutral";
+    if (score <= 75) return "Greed";
+    return "Extreme Greed";
+  }
 
-  // Crypto Fear & Greed (Alternative.me - free, no key needed)
+  const sources = {};
+  let cnnScore = null, cnnLabel = null;
+  let cryptoScore = null, cryptoLabel = null;
+
+  // 1) CNN Fear & Greed — public JSON endpoint
   try {
-    const cryptoRes = await fetch("https://api.alternative.me/fng/?limit=2");
-    const cryptoJson = await cryptoRes.json();
-    const latest = cryptoJson.data?.[0];
-    const previous = cryptoJson.data?.[1];
-    if (latest) {
-      results.cryptoScore = parseInt(latest.value);
-      results.cryptoLabel = latest.value_classification;
-      results.cryptoPrev = previous ? parseInt(previous.value) : null;
+    const cnnUrl = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata";
+    const cnnResp = await fetch(cnnUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.cnn.com/markets/fear-and-greed",
+      },
+    });
+    if (cnnResp.ok) {
+      const cnnJson = await cnnResp.json();
+      if (cnnJson?.fear_and_greed?.score != null) {
+        cnnScore = Math.round(cnnJson.fear_and_greed.score);
+        cnnLabel = cnnJson.fear_and_greed.rating
+          ? cnnJson.fear_and_greed.rating.charAt(0).toUpperCase() + cnnJson.fear_and_greed.rating.slice(1)
+          : labelFor(cnnScore);
+        sources.cnn = "production.dataviz.cnn.io";
+      }
+    } else {
+      sources.cnn_error = `HTTP ${cnnResp.status}`;
     }
-  } catch(e) {
-    results.cryptoError = e.message;
+  } catch (e) {
+    sources.cnn_error = e.message;
   }
 
- // Stock Market Fear & Greed — from feargreedmeter.com
-try {
-  const fgRes = await fetch("https://feargreedmeter.com/", {
-    headers: { "User-Agent": "Mozilla/5.0" }
+  // 2) Alternative.me Crypto Fear & Greed
+  try {
+    const altUrl = "https://api.alternative.me/fng/?limit=1&format=json";
+    const altResp = await fetch(altUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (altResp.ok) {
+      const altJson = await altResp.json();
+      const item = altJson?.data?.[0];
+      if (item?.value != null) {
+        cryptoScore = parseInt(item.value, 10);
+        cryptoLabel = (item.value_classification || labelFor(cryptoScore)).toUpperCase();
+        sources.crypto = "alternative.me";
+      }
+    } else {
+      sources.crypto_error = `HTTP ${altResp.status}`;
+    }
+  } catch (e) {
+    sources.crypto_error = e.message;
+  }
+
+  // Cache 30 minutes server-side, allow stale
+  res.setHeader("Cache-Control", "s-maxage=1800, stale-while-revalidate");
+
+  res.status(200).json({
+    cnnScore,
+    cnnLabel,
+    cryptoScore,
+    cryptoLabel,
+    timestamp: new Date().toISOString(),
+    sources,
   });
-  const html = await fgRes.text();
-  const match = html.match(/currently\s+(?:stands\s+)?at\s+(\d+)/i)
-    || html.match(/"score"\s*:\s*(\d+)/i)
-    || html.match(/index.*?(\d+).*?Extreme Fear/i);
-  if (match) {
-    const score = parseInt(match[1]);
-    results.cnnScore = score;
-    results.cnnLabel = score <= 25 ? "Extreme Fear" : score <= 44 ? "Fear" : score <= 55 ? "Neutral" : score <= 75 ? "Greed" : "Extreme Greed";
-  }
-} catch(e) {
-  results.cnnError = e.message;
-}
-
-  res.status(200).json(results);
 }
