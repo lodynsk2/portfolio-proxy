@@ -42,15 +42,22 @@ export default async function handler(req, res) {
 
   function computeRSI(candles, period = 14) {
     if (candles.length < period + 1) return null;
-    let gains = 0, losses = 0;
-    for (let i = candles.length - period; i < candles.length; i++) {
-      const diff = candles[i].c - candles[i - 1].c;
-      if (diff > 0) gains += diff; else losses -= diff;
+    // Wilder's smoothed RSI — seed with SMA, then apply EMA smoothing
+    var firstGains = 0, firstLosses = 0;
+    for (var i = 1; i <= period; i++) {
+      var diff = candles[i].c - candles[i - 1].c;
+      if (diff > 0) firstGains += diff; else firstLosses -= diff;
     }
-    const avgGain = gains / period;
-    const avgLoss = losses / period;
+    var avgGain = firstGains / period;
+    var avgLoss = firstLosses / period;
+    // Apply Wilder smoothing for remaining candles
+    for (var j = period + 1; j < candles.length; j++) {
+      var d = candles[j].c - candles[j - 1].c;
+      avgGain = (avgGain * (period - 1) + (d > 0 ? d : 0)) / period;
+      avgLoss = (avgLoss * (period - 1) + (d < 0 ? -d : 0)) / period;
+    }
     if (avgLoss === 0) return 100;
-    const rs = avgGain / avgLoss;
+    var rs = avgGain / avgLoss;
     return +(100 - 100 / (1 + rs)).toFixed(1);
   }
 
