@@ -1,6 +1,8 @@
 // File path in your portfolio-proxy-ja56 repo: api/claude.js
-// Proxies requests to the Anthropic Claude API from the browser.
-// Requires environment variable: ANTHROPIC_API_KEY
+// (keeping the filename so the frontend doesn't need URL changes)
+// Routes to Google Gemini API (free tier) instead of Anthropic.
+// Requires environment variable: GEMINI_API_KEY
+// Get your free key at: https://aistudio.google.com/apikey
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -15,53 +17,65 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: "ANTHROPIC_API_KEY env var not set. Go to Vercel project Settings > Environment Variables and add it." });
-  }
-
-  if (!ANTHROPIC_API_KEY.startsWith("sk-ant-")) {
-    return res.status(500).json({ error: "ANTHROPIC_API_KEY appears invalid. Should start with sk-ant-. Current value starts with: " + ANTHROPIC_API_KEY.slice(0, 6) + "..." });
+  const GEMINI_KEY = process.env.GEMINI_API_KEY;
+  if (!GEMINI_KEY) {
+    return res.status(500).json({ error: "GEMINI_API_KEY env var not set. Get a free key at https://aistudio.google.com/apikey" });
   }
 
   try {
     const body = req.body;
     if (!body || !body.messages) {
-      return res.status(400).json({ error: "Missing messages in request body", received: typeof body });
+      return res.status(400).json({ error: "Missing messages in request body" });
     }
 
-    const payload = {
-      model: body.model || "claude-sonnet-4-6",
-      max_tokens: body.max_tokens || 1000,
-      messages: body.messages,
-    };
-    if (body.tools) payload.tools = body.tools;
-
-    const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify(payload),
+    // Convert Anthropic message format to Gemini format
+    const geminiContents = body.messages.map(function(msg) {
+      return {
+        role: msg.role === "assistant" ? "model" : "user",
+        parts: [{ text: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) }]
+      };
     });
 
-    const data = await anthropicRes.json();
+    const model = "gemini-2.0-flash";
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
 
-    if (!anthropicRes.ok) {
-      return res.status(anthropicRes.status).json({
-        error: "Anthropic API error",
-        status: anthropicRes.status,
-        detail: data,
+    const geminiRes = await fetch(geminiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: geminiContents,
+        generationConfig: {
+          maxOutputTokens: body.max_tokens || 1000,
+          temperature: 0.7,
+        },
+      }),
+    });
+
+    const geminiData = await geminiRes.json();
+
+    if (!geminiRes.ok) {
+      return res.status(geminiRes.status).json({
+        error: "Gemini API error",
+        status: geminiRes.status,
+        detail: geminiData,
       });
     }
 
+    // Convert Gemini response to Anthropic-compatible format
+    // so the frontend parsing code works without changes
+    const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    const anthropicFormat = {
+      content: [{ type: "text", text: text }],
+      model: model,
+      stop_reason: "end_turn",
+    };
+
     res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json(data);
+    return res.status(200).json(anthropicFormat);
   } catch (err) {
     return res.status(500).json({
-      error: "Proxy internal error: " + err.message,
+      error: "Proxy error: " + err.message,
     });
   }
 }
