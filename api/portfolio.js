@@ -12,7 +12,7 @@ export default async function handler(req, res) {
   if (tickers.length === 0) return res.status(400).json({ error: "No tickers provided" });
 
   async function fetchYahoo(symbol) {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=2y&interval=1d`;
     const r = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" }
     });
@@ -22,7 +22,9 @@ export default async function handler(req, res) {
     if (!result) return null;
     const ts = result.timestamp || [];
     const q = result.indicators?.quote?.[0] || {};
-    const closes = q.close || [];
+    // Use adjclose if available, fall back to close
+    const adjArr = result.indicators?.adjclose?.[0]?.adjclose;
+    const closes = adjArr || q.close || [];
     const highs = q.high || [];
     const lows = q.low || [];
     const out = [];
@@ -152,7 +154,7 @@ export default async function handler(req, res) {
       }
     }));
 
-    res.setHeader("Cache-Control", "s-maxage=600, stale-while-revalidate");
+    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate");
     res.status(200).json({ holdings: results, timestamp: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ error: err.message });
