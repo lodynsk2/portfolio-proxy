@@ -178,7 +178,7 @@ function sourceUrls(cik) {
   ];
 }
 
-module.exports = async function handler(req,res) {
+export default async function handler(req,res) {
   try {
     const ticker=String((req.query&&req.query.ticker)||"").trim().toUpperCase();
     if(!ticker) return res.status(400).json({error:"ticker is required"});
