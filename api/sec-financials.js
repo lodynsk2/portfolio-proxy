@@ -1,318 +1,403 @@
-// Vercel Serverless Function: /api/sec-financials?ticker=MSFT
-// Source of truth: SEC EDGAR Company Facts + Submissions APIs.
-// Set SEC_CONTACT in Vercel env to a real contact string.
+// Stable SEC Financials endpoint for Vercel
+// Save as: /api/sec-financials.js
+// Primary target: U.S. domestic SEC filers using 10-K / 10-Q and US-GAAP XBRL.
+// Set SEC_CONTACT in Vercel, e.g. "PortfolioManager you@example.com".
 
 const SEC_BASE = "https://data.sec.gov";
 const SEC_WWW = "https://www.sec.gov";
 const UA = process.env.SEC_CONTACT || "PortfolioManager financial-dashboard contact@example.com";
 const DAY = 24 * 60 * 60 * 1000;
-const ANNUAL_FORMS = new Set(["10-K","10-K/A","20-F","20-F/A","40-F","40-F/A"]);
-const INTERIM_FORMS = new Set(["10-Q","10-Q/A","6-K","6-K/A"]);
-const FILED_FORMS = new Set([...ANNUAL_FORMS, ...INTERIM_FORMS]);
 let tickerCache = null;
 let tickerCacheAt = 0;
 
-function headers(){
-  return {"User-Agent":UA,"Accept-Encoding":"gzip, deflate","Accept":"application/json"};
+function cors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Cache-Control", "s-maxage=21600, stale-while-revalidate=86400");
 }
-async function fetchJson(url){
-  const r = await fetch(url,{headers:headers()});
-  if(!r.ok) throw new Error(`SEC request failed ${r.status}: ${url}`);
+
+function secHeaders() {
+  return {
+    "User-Agent": UA,
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate"
+  };
+}
+
+async function fetchJson(url) {
+  const r = await fetch(url, { headers: secHeaders() });
+  if (!r.ok) throw new Error(`SEC request failed ${r.status}: ${url}`);
   return r.json();
 }
-async function tickerMap(){
-  if(tickerCache && Date.now()-tickerCacheAt<DAY) return tickerCache;
+
+async function tickerMap() {
+  if (tickerCache && Date.now() - tickerCacheAt < DAY) return tickerCache;
   const raw = await fetchJson(`${SEC_WWW}/files/company_tickers.json`);
-  const map={};
-  Object.values(raw||{}).forEach(x=>{if(x&&x.ticker) map[String(x.ticker).toUpperCase()]=x;});
-  tickerCache=map; tickerCacheAt=Date.now(); return map;
-}
-function daysBetween(a,b){if(!a||!b)return null;return Math.round((new Date(b)-new Date(a))/86400000);}
-function allUnits(fact,unit){
-  if(!fact||!fact.units)return [];
-  if(unit&&fact.units[unit])return fact.units[unit];
-  const keys=Object.keys(fact.units); return keys.length?fact.units[keys[0]]:[];
-}
-function unitKeys(fact){return fact&&fact.units?Object.keys(fact.units):[];}
-function isMoneyUnit(u){return !!u && u!=="shares" && u!=="pure" && !String(u).includes("/shares");}
-function chooseMoneyUnit(fact,preferred){
-  const keys=unitKeys(fact).filter(isMoneyUnit);
-  if(preferred&&keys.includes(preferred))return preferred;
-  if(keys.includes("USD"))return "USD";
-  return keys[0]||null;
-}
-function choosePerShareUnit(fact,currency){
-  const keys=unitKeys(fact);
-  if(currency&&keys.includes(currency+"/shares"))return currency+"/shares";
-  return keys.find(k=>String(k).endsWith("/shares"))||null;
-}
-function latestFiledWins(rows){
-  const out=new Map();
-  for(const x of rows){
-    if(!x||!x.end)continue;
-    const prev=out.get(x.end);
-    if(!prev || String(x.filed||"")>String(prev.filed||"")) out.set(x.end,x);
-  }
-  return out;
-}
-function annualRows(fact,unit){
-  const rows=allUnits(fact,unit).filter(x=>{
-    if(!x||!x.start||!x.end||!ANNUAL_FORMS.has(x.form||""))return false;
-    const d=daysBetween(x.start,x.end); return d!=null&&d>=250&&d<=450;
+  const map = {};
+  Object.values(raw || {}).forEach((x) => {
+    if (x && x.ticker) map[String(x.ticker).toUpperCase()] = x;
   });
-  return [...latestFiledWins(rows).values()].sort((a,b)=>String(a.end).localeCompare(String(b.end)));
+  tickerCache = map;
+  tickerCacheAt = Date.now();
+  return map;
 }
-function interimRows(fact,unit,afterEnd){
-  return allUnits(fact,unit).filter(x=>{
-    if(!x||!x.start||!x.end||!INTERIM_FORMS.has(x.form||""))return false;
-    if(afterEnd&&x.end<=afterEnd)return false;
-    const d=daysBetween(x.start,x.end); return d!=null&&d>=60&&d<=300;
-  });
-}
-function latestInstant(fact,unit){
-  const rows=allUnits(fact,unit).filter(x=>x&&x.end&&FILED_FORMS.has(x.form||""));
-  rows.sort((a,b)=>String(a.end).localeCompare(String(b.end))||String(a.filed||"").localeCompare(String(b.filed||"")));
-  return rows.length?rows[rows.length-1]:null;
-}
-function latestDuration(fact,unit){
-  const rows=allUnits(fact,unit).filter(x=>{
-    if(!x||!x.start||!x.end||!FILED_FORMS.has(x.form||""))return false;
-    const d=daysBetween(x.start,x.end); return d!=null&&d>=60&&d<=450;
-  });
-  rows.sort((a,b)=>String(a.end).localeCompare(String(b.end))||String(a.filed||"").localeCompare(String(b.filed||"")));
-  return rows.length?rows[rows.length-1]:null;
-}
-function itemVal(x){return x&&Number.isFinite(Number(x.val))?Number(x.val):null;}
-function valueAt(map,end){const x=map&&map.get(end);return itemVal(x);}
 
-function candidateFacts(facts,names){
-  const out=[];
-  for(const taxonomy of ["us-gaap","ifrs-full","dei"]){
-    const tax=(facts&&facts[taxonomy])||{};
-    for(const name of names){if(tax[name])out.push({taxonomy,name,fact:tax[name]});}
+function daysBetween(a, b) {
+  if (!a || !b) return null;
+  return Math.round((new Date(b) - new Date(a)) / 86400000);
+}
+
+function getUnitRows(fact, unit) {
+  if (!fact || !fact.units) return [];
+  if (unit && fact.units[unit]) return fact.units[unit];
+  return [];
+}
+
+function annualRows(fact, unit) {
+  const byEnd = new Map();
+  for (const x of getUnitRows(fact, unit)) {
+    if (!x || !x.start || !x.end || !/^(10-K|10-K\/A)$/.test(x.form || "")) continue;
+    const d = daysBetween(x.start, x.end);
+    if (d == null || d < 250 || d > 450) continue;
+    const prev = byEnd.get(x.end);
+    if (!prev || String(x.filed || "") > String(prev.filed || "")) byEnd.set(x.end, x);
   }
-  return out;
+  return [...byEnd.values()].sort((a, b) => String(a.end).localeCompare(String(b.end)));
 }
-function isBetterAnnualCandidate(candidate,best){
-  if(!best)return true;
-  // RECENCY FIRST.  A legacy tag with 15 years of history must never beat a
-  // current tag merely because it has more rows (this was the Apple 2017 bug).
-  if(candidate.latest!==best.latest)return candidate.latest>best.latest;
-  if(candidate.rows.length!==best.rows.length)return candidate.rows.length>best.rows.length;
-  // Prefer the order supplied in `names` / taxonomy iteration only as a final tie-break.
-  return false;
+
+function latestInstant(fact, unit) {
+  const rows = getUnitRows(fact, unit).filter((x) =>
+    x && x.end && /^(10-K|10-K\/A|10-Q|10-Q\/A)$/.test(x.form || "")
+  );
+  rows.sort((a, b) =>
+    String(a.end).localeCompare(String(b.end)) ||
+    String(a.filed || "").localeCompare(String(b.filed || ""))
+  );
+  return rows.length ? rows[rows.length - 1] : null;
 }
-function bestAnnualFact(facts,names,type="money",preferredCurrency=null){
-  let best=null;
-  for(const c of candidateFacts(facts,names)){
-    let unit=type==="shares"?"shares":type==="eps"?choosePerShareUnit(c.fact,preferredCurrency):chooseMoneyUnit(c.fact,preferredCurrency);
-    if(!unit)continue;
-    const rows=annualRows(c.fact,unit);
-    if(!rows.length)continue;
-    const latest=rows[rows.length-1].end||"";
-    const candidate={...c,unit,rows,latest};
-    if(isBetterAnnualCandidate(candidate,best))best=candidate;
+
+function itemVal(x) {
+  return x && Number.isFinite(Number(x.val)) ? Number(x.val) : null;
+}
+
+function factCandidates(facts, names) {
+  const tax = (facts && facts["us-gaap"]) || {};
+  return names.filter((name) => tax[name]).map((name) => ({ name, fact: tax[name] }));
+}
+
+// Critical reliability rule: choose the concept whose annual series has the NEWEST period end.
+// This prevents legacy tags from winning simply because they contain more old history.
+function bestAnnualConcept(facts, names, unit) {
+  let best = null;
+  for (const c of factCandidates(facts, names)) {
+    const rows = annualRows(c.fact, unit);
+    if (!rows.length) continue;
+    const latest = rows[rows.length - 1].end || "";
+    if (
+      !best ||
+      latest > best.latest ||
+      (latest === best.latest && rows.length > best.rows.length)
+    ) {
+      best = { name: c.name, fact: c.fact, rows, latest };
+    }
   }
   return best;
 }
-function bestFactForUnit(facts,names,unit){
-  let best=null;
-  for(const c of candidateFacts(facts,names)){
-    if(!unitKeys(c.fact).includes(unit))continue;
-    const rows=annualRows(c.fact,unit);
-    if(!rows.length)continue;
-    const latest=rows[rows.length-1].end||"";
-    const candidate={...c,unit,rows,latest};
-    if(isBetterAnnualCandidate(candidate,best))best=candidate;
+
+function bestInstantConcept(facts, names, unit) {
+  let best = null;
+  for (const c of factCandidates(facts, names)) {
+    const x = latestInstant(c.fact, unit);
+    if (!x) continue;
+    if (
+      !best ||
+      String(x.end) > String(best.row.end) ||
+      (String(x.end) === String(best.row.end) && String(x.filed || "") > String(best.row.filed || ""))
+    ) {
+      best = { name: c.name, fact: c.fact, row: x };
+    }
   }
   return best;
 }
-function annualMap(best){return best?new Map(best.rows.map(x=>[x.end,x])):new Map();}
 
-function classifyProfile(sub){
-  const sic=Number(sub&&sub.sic)||0;
-  const desc=String((sub&&sub.sicDescription)||"").toLowerCase();
-  if(sic===6798||desc.includes("real estate investment trust")||desc.includes("reit")) return "reit";
-  if(sic>=6000&&sic<=6799) return "financial";
+function mapByEnd(best) {
+  return new Map((best && best.rows ? best.rows : []).map((x) => [x.end, x]));
+}
+
+function valueAt(map, end) {
+  return itemVal(map && map.get(end));
+}
+
+function pickLatestInterim(fact, unit, afterAnnualEnd) {
+  const rows = getUnitRows(fact, unit).filter((x) => {
+    if (!x || !x.start || !x.end || !/^(10-Q|10-Q\/A)$/.test(x.form || "")) return false;
+    if (afterAnnualEnd && x.end <= afterAnnualEnd) return false;
+    const d = daysBetween(x.start, x.end);
+    return d != null && d >= 60 && d <= 300;
+  });
+  if (!rows.length) return null;
+  const newestEnd = rows.map((x) => x.end).sort().slice(-1)[0];
+  const same = rows.filter((x) => x.end === newestEnd);
+  same.sort((a, b) =>
+    (daysBetween(a.start, a.end) || 0) - (daysBetween(b.start, b.end) || 0) ||
+    String(a.filed || "").localeCompare(String(b.filed || ""))
+  );
+  return same[same.length - 1] || null;
+}
+
+function classifyProfile(sub) {
+  const sic = Number(sub && sub.sic) || 0;
+  if (sic >= 6000 && sic <= 6799) return "financial";
   return "standard";
 }
-function sourceUrls(cik){
-  const padded=String(cik).padStart(10,"0");
+
+function sourceUrls(cik) {
+  const padded = String(cik).padStart(10, "0");
   return [
-    {label:"SEC Company Facts",url:`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`,type:"SEC"},
-    {label:"SEC Submissions",url:`https://data.sec.gov/submissions/CIK${padded}.json`,type:"SEC"}
+    { label: "SEC Company Facts", url: `https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`, type: "SEC" },
+    { label: "SEC Submissions", url: `https://data.sec.gov/submissions/CIK${padded}.json`, type: "SEC" }
   ];
 }
-function countValues(periods){
-  const keys=["revenue","grossProfit","ebitda","operatingIncome","netIncome","eps","operatingCashFlow","capex","freeCashFlow"];
-  return (periods||[]).reduce((n,p)=>n+keys.reduce((m,k)=>m+(p&&p[k]!=null?1:0),0),0);
+
+function countPeriodValues(periods) {
+  const keys = ["revenue", "grossProfit", "ebitda", "operatingIncome", "netIncome", "eps", "operatingCashFlow", "capex", "freeCashFlow"];
+  return (periods || []).reduce((n, p) => n + keys.reduce((m, k) => m + (p && p[k] != null ? 1 : 0), 0), 0);
 }
 
-function buildDataset(facts,sub,listedTickers){
-  const revenueNames=["RevenueFromContractWithCustomerExcludingAssessedTax","Revenues","SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet","Revenue"];
-  const revenueBest=bestAnnualFact(facts,revenueNames,"money",null);
-  if(!revenueBest)throw new Error("No usable annual revenue facts were found for this issuer");
-  const currency=revenueBest.unit;
-  const annualBase=revenueBest.rows.slice(-5);
-  const annualEnds=annualBase.map(x=>x.end);
-  const latestAnnualEnd=annualEnds[annualEnds.length-1];
+export default async function handler(req, res) {
+  cors(res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "GET") return res.status(405).json({ error: "GET only" });
 
-  const concepts={
-    grossProfit:bestFactForUnit(facts,["GrossProfit"],currency),
-    operatingIncome:bestFactForUnit(facts,["OperatingIncomeLoss","ProfitLossFromOperatingActivities"],currency),
-    netIncome:bestFactForUnit(facts,["NetIncomeLoss","ProfitLoss","NetIncomeLossAvailableToCommonStockholdersBasic"],currency),
-    ocf:bestFactForUnit(facts,["NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInOperatingActivitiesContinuingOperations","CashFlowsFromUsedInOperatingActivities"],currency),
-    capex:bestFactForUnit(facts,["PaymentsToAcquirePropertyPlantAndEquipment","PaymentsForAdditionsToPropertyPlantAndEquipment","PaymentsToAcquireProductiveAssets","PurchaseOfPropertyPlantAndEquipment"],currency),
-    da:bestFactForUnit(facts,["DepreciationDepletionAndAmortization","DepreciationDepletionAndAmortizationPropertyPlantAndEquipment","Depreciation","DepreciationAndAmortisationExpense"],currency),
-    assets:bestFactForUnit(facts,["Assets"],currency),
-    equity:bestFactForUnit(facts,["StockholdersEquity","StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest","Equity"],currency),
-    interest:bestFactForUnit(facts,["InterestExpenseNonOperating","InterestExpense","FinanceCosts"],currency)
-  };
-  const epsBest=bestAnnualFact(facts,["EarningsPerShareDiluted","DilutedEarningsLossPerShare"],"eps",currency);
-  const dilutedSharesBest=bestAnnualFact(facts,["WeightedAverageNumberOfDilutedSharesOutstanding","WeightedAverageNumberOfSharesOutstandingDiluted"],"shares");
-  const maps={revenue:annualMap(revenueBest)};
-  Object.keys(concepts).forEach(k=>maps[k]=annualMap(concepts[k]));
-  maps.eps=annualMap(epsBest); maps.dilutedShares=annualMap(dilutedSharesBest);
+  try {
+    let ticker = String((req.query && req.query.ticker) || "").trim().toUpperCase();
+    if (!ticker) return res.status(400).json({ error: "ticker is required" });
 
-  const historical=annualBase.map(base=>{
-    const end=base.end;
-    const fy=base.fy!=null?Number(base.fy):Number(end.slice(0,4));
-    const revenue=valueAt(maps.revenue,end),op=valueAt(maps.operatingIncome,end),da=valueAt(maps.da,end);
-    const ocf=valueAt(maps.ocf,end),capexRaw=valueAt(maps.capex,end),capex=capexRaw==null?null:Math.abs(capexRaw);
-    return {
-      year:fy, fiscalYear:fy, fiscalPeriod:base.fp||"FY", periodLabel:`FY ${fy}`, periodType:"FY", periodEnd:end, form:base.form||null, filed:base.filed||null,
-      revenue,grossProfit:valueAt(maps.grossProfit,end),ebitda:(op!=null&&da!=null)?op+da:null,operatingIncome:op,netIncome:valueAt(maps.netIncome,end),eps:valueAt(maps.eps,end),
-      dilutedWeightedShares:valueAt(maps.dilutedShares,end),operatingCashFlow:ocf,capex,freeCashFlow:(ocf!=null&&capex!=null)?ocf-capex:null,
-      assets:valueAt(maps.assets,end),equity:valueAt(maps.equity,end),interestExpense:valueAt(maps.interest,end)
-    };
-  });
-
-  // Latest interim period based on revenue; 10-Q for domestic issuers and 6-K where structured foreign-issuer interim facts exist.
-  const revInterim=interimRows(revenueBest.fact,currency,latestAnnualEnd);
-  let currentPeriod=null;
-  if(revInterim.length){
-    const maxEnd=revInterim.map(x=>x.end).sort().slice(-1)[0];
-    const same=revInterim.filter(x=>x.end===maxEnd).sort((a,b)=>(daysBetween(a.start,a.end)||0)-(daysBetween(b.start,b.end)||0)||String(a.filed||"").localeCompare(String(b.filed||"")));
-    const r=same[same.length-1]; const duration=daysBetween(r.start,r.end)||0;
-    const periodType=duration>120?"YTD":"QTD";
-    const fy=r.fy!=null?Number(r.fy):Number(r.end.slice(0,4)); const fp=r.fp?String(r.fp).toUpperCase():null;
-    const get=(names,type="money")=>{
-      let bf=type==="eps"?bestAnnualFact(facts,names,"eps",currency):type==="shares"?bestAnnualFact(facts,names,"shares"):bestFactForUnit(facts,names,currency);
-      if(!bf)return null; const unit=type==="eps"?choosePerShareUnit(bf.fact,currency):type==="shares"?"shares":currency;
-      const rows=allUnits(bf.fact,unit).filter(x=>x&&x.end===r.end&&INTERIM_FORMS.has(x.form||""));
-      if(!rows.length)return null;
-      rows.sort((a,b)=>Math.abs((daysBetween(a.start,a.end)||0)-duration)-Math.abs((daysBetween(b.start,b.end)||0)-duration)||String(b.filed||"").localeCompare(String(a.filed||"")));
-      return itemVal(rows[0]);
-    };
-    const revenue=itemVal(r),gross=get(["GrossProfit"]),op=get(["OperatingIncomeLoss","ProfitLossFromOperatingActivities"]),ni=get(["NetIncomeLoss","ProfitLoss","NetIncomeLossAvailableToCommonStockholdersBasic"]),eps=get(["EarningsPerShareDiluted","DilutedEarningsLossPerShare"],"eps"),ocf=get(["NetCashProvidedByUsedInOperatingActivities","NetCashProvidedByUsedInOperatingActivitiesContinuingOperations","CashFlowsFromUsedInOperatingActivities"]),capexRaw=get(["PaymentsToAcquirePropertyPlantAndEquipment","PaymentsForAdditionsToPropertyPlantAndEquipment","PaymentsToAcquireProductiveAssets","PurchaseOfPropertyPlantAndEquipment"]),capex=capexRaw==null?null:Math.abs(capexRaw),da=get(["DepreciationDepletionAndAmortization","DepreciationDepletionAndAmortizationPropertyPlantAndEquipment","Depreciation","DepreciationAndAmortisationExpense"]);
-    let label=`${periodType} through ${r.end}`; if(fp&&/^Q[1-4]$/.test(fp))label=`${fp} FY${fy}${periodType==="YTD"&&fp!=="Q1"?" YTD":""}`;
-    currentPeriod={year:fy,fiscalYear:fy,fiscalPeriod:fp,periodLabel:label,periodType,periodEnd:r.end,form:r.form||null,filed:r.filed||null,revenue,grossProfit:gross,ebitda:(op!=null&&da!=null)?op+da:null,operatingIncome:op,netIncome:ni,eps,operatingCashFlow:ocf,capex,freeCashFlow:(ocf!=null&&capex!=null)?ocf-capex:null};
-  }
-
-  function latestBalance(names){
-    let best=null;
-    for(const c of candidateFacts(facts,names)){
-      const unit=chooseMoneyUnit(c.fact,currency); if(unit!==currency)continue;
-      const x=latestInstant(c.fact,unit); if(x&&(!best||String(x.end)>String(best.end)||String(x.filed||"")>String(best.filed||"")))best=x;
+    const requestedTicker = ticker;
+    const map = await tickerMap();
+    let meta = map[ticker];
+    if (!meta && ticker.includes(".")) {
+      ticker = ticker.replace(/\./g, "-");
+      meta = map[ticker];
     }
-    return itemVal(best);
-  }
-  const cash=latestBalance(["CashAndCashEquivalentsAtCarryingValue","CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents","CashAndDueFromBanks","CashAndCashEquivalents"]);
-  const marketableSecurities=latestBalance(["MarketableSecuritiesCurrent","ShortTermInvestments"]);
-  const liquidAssets=(cash!=null||marketableSecurities!=null)?Number(cash||0)+Number(marketableSecurities||0):null;
-  const debtCurrent=latestBalance(["LongTermDebtCurrent","ShortTermBorrowings","ShortTermDebtCurrent","CurrentBorrowings"]);
-  let debtNoncurrent=latestBalance(["LongTermDebtNoncurrent","LongTermDebtAndFinanceLeaseObligationsNoncurrent","NoncurrentBorrowings"]);
-  if(debtNoncurrent==null)debtNoncurrent=latestBalance(["LongTermDebt"]);
-  const debt=(debtCurrent!=null||debtNoncurrent!=null)?Number(debtCurrent||0)+Number(debtNoncurrent||0):null;
+    if (!meta) return res.status(404).json({ error: `Ticker ${requestedTicker} not found in SEC ticker list` });
 
-  // Shares outstanding. For multi-ticker CIKs (e.g. GOOG/GOOGL, BRK.A/BRK.B), a single-class price times aggregate shares is unsafe.
-  let shares=null,sharesAsOf=null,sharesBasis=null,sharesApproximate=false;
-  for(const c of candidateFacts(facts,["EntityCommonStockSharesOutstanding","CommonStockSharesOutstanding"])){
-    if(!unitKeys(c.fact).includes("shares"))continue;
-    const x=latestInstant(c.fact,"shares");
-    if(x&&(!sharesAsOf||String(x.end)>=String(sharesAsOf))){shares=itemVal(x);sharesAsOf=x.end;sharesBasis="SEC shares outstanding";}
-  }
-  if(shares==null){
-    const ds=bestAnnualFact(facts,["WeightedAverageNumberOfDilutedSharesOutstanding","WeightedAverageNumberOfSharesOutstandingDiluted"],"shares");
-    const x=ds?latestDuration(ds.fact,"shares"):null; shares=itemVal(x); sharesAsOf=x&&x.end||null; sharesBasis=shares!=null?"SEC diluted weighted-average shares (fallback)":null; sharesApproximate=shares!=null;
-  }
+    const cik = String(meta.cik_str).padStart(10, "0");
+    const [cf, sub] = await Promise.all([
+      fetchJson(`${SEC_BASE}/api/xbrl/companyfacts/CIK${cik}.json`),
+      fetchJson(`${SEC_BASE}/submissions/CIK${cik}.json`)
+    ]);
+    const facts = cf.facts || {};
 
-  const profile=classifyProfile(sub);
-  const latest=historical[historical.length-1]||{},prior=historical.length>1?historical[historical.length-2]:null;
-  const avg=(a,b)=>(a!=null&&b!=null)?(Number(a)+Number(b))/2:null;
-  const avgEquity=prior?avg(prior.equity,latest.equity):null,avgAssets=prior?avg(prior.assets,latest.assets):null;
-  const ratios={
-    grossMargin:latest.revenue&&latest.grossProfit!=null?latest.grossProfit/latest.revenue*100:null,
-    operatingMargin:latest.revenue&&latest.operatingIncome!=null?latest.operatingIncome/latest.revenue*100:null,
-    ebitdaMargin:profile==="financial"?null:(latest.revenue&&latest.ebitda!=null?latest.ebitda/latest.revenue*100:null),
-    netMargin:latest.revenue&&latest.netIncome!=null?latest.netIncome/latest.revenue*100:null,
-    roe:avgEquity&&latest.netIncome!=null?latest.netIncome/avgEquity*100:null,
-    roa:avgAssets&&latest.netIncome!=null?latest.netIncome/avgAssets*100:null,
-    roic:null,
-    currentRatio:profile==="financial"?null:null,
-    debtToEquity:debt!=null&&latest.equity?debt/latest.equity:null,
-    interestCoverage:profile==="financial"?null:(latest.interestExpense&&latest.operatingIncome!=null?latest.operatingIncome/Math.abs(latest.interestExpense):null)
-  };
-  // Current ratio from latest instant values only for non-financials.
-  if(profile!=="financial"){
-    const ac=latestBalance(["AssetsCurrent","CurrentAssets"]),lc=latestBalance(["LiabilitiesCurrent","CurrentLiabilities"]);
-    ratios.currentRatio=ac&&lc?ac/lc:null;
-  }
+    const revenueBest = bestAnnualConcept(facts, [
+      "RevenueFromContractWithCustomerExcludingAssessedTax",
+      "Revenues",
+      "SalesRevenueNet",
+      "SalesRevenueGoodsNet",
+      "SalesRevenueServicesNet"
+    ], "USD");
+    if (!revenueBest) return res.status(422).json({ error: "No usable recent annual revenue XBRL facts were found" });
 
-  const warnings=[]; const checks=[];
-  checks.push({name:"Annual periods",status:historical.length>=3?"PASS":"WARN",detail:`${historical.length} completed annual periods`});
-  if(historical.length<5)warnings.push("Fewer than five completed annual periods were available in structured SEC facts.");
-  for(const p of historical){
-    if(p.freeCashFlow!=null&&p.operatingCashFlow!=null&&p.capex!=null){
-      const diff=Math.abs(p.freeCashFlow-(p.operatingCashFlow-p.capex)); const tol=Math.max(1,Math.abs(p.freeCashFlow)*1e-9);
-      if(diff>tol)warnings.push(`${p.periodLabel}: free cash flow failed OCF − CapEx check.`);
-    }
-  }
-  checks.push({name:"FCF formula",status:warnings.some(w=>w.includes("free cash flow"))?"WARN":"PASS",detail:"FCF is derived only as operating cash flow minus CapEx"});
-  if(currentPeriod&&currentPeriod.periodEnd<=latestAnnualEnd)warnings.push("Interim period was not newer than the latest annual period and should be reviewed.");
-  if(profile==="financial")warnings.push("Financial-institution profile: EBITDA, EV/EBITDA, current ratio, and interest coverage are intentionally withheld when not decision-useful.");
-  const multipleShareClasses=(listedTickers||[]).length>1;
-  if(multipleShareClasses)warnings.push(`Multiple listed tickers share this CIK (${listedTickers.join(", ")}); price × aggregate shares is disabled for market-cap fallback.`);
-  if(currency!=="USD")warnings.push(`Statements are reported in ${currency}. DCF-to-U.S.-listed-share comparisons require FX/ADR conversion and should be disabled unless explicitly converted.`);
-  if(sharesApproximate)warnings.push("Only diluted weighted-average shares were available; this is not treated as a precise market-cap share count.");
-  const checkedValues=countValues(historical)+(currentPeriod?countValues([currentPeriod]):0)+(cash!=null?1:0)+(debt!=null?1:0)+(shares!=null?1:0);
+    const annualBase = revenueBest.rows.slice(-5);
+    const annualEnds = annualBase.map((x) => x.end);
+    const latestAnnualEnd = annualEnds[annualEnds.length - 1];
 
-  return {
-    historical,currentPeriod,currency,profile,ratios,cash,marketableSecurities,liquidAssets,debt,shares,sharesAsOf,sharesBasis,sharesApproximate,multipleShareClasses,listedTickers,
-    selectedConcepts:{revenue:revenueBest.name,revenueTaxonomy:revenueBest.taxonomy,revenueLatestEnd:revenueBest.latest},
-    marketCapDerivationAllowed:currency==="USD"&&!multipleShareClasses&&!sharesApproximate&&shares!=null,
-    evMetricsMeaningful:profile!=="financial",
-    dcfComparableToQuote:currency==="USD"&&!multipleShareClasses,
-    validation:{status:warnings.length?"WARN":"PASS",warnings,checks,checkedValues},
-    metricNotes:profile==="financial"?"Financial-institution profile: prioritize P/E, P/B, ROE/ROA and capital metrics over EV/EBITDA.":profile==="reit"?"REIT profile: generic EBITDA/DCF should be supplemented with FFO/AFFO.":"Standard corporate profile"
-  };
-}
+    const concepts = {
+      grossProfit: bestAnnualConcept(facts, ["GrossProfit"], "USD"),
+      operatingIncome: bestAnnualConcept(facts, ["OperatingIncomeLoss"], "USD"),
+      netIncome: bestAnnualConcept(facts, ["NetIncomeLoss", "ProfitLoss"], "USD"),
+      eps: bestAnnualConcept(facts, ["EarningsPerShareDiluted"], "USD/shares"),
+      ocf: bestAnnualConcept(facts, ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"], "USD"),
+      capex: bestAnnualConcept(facts, ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsForAdditionsToPropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"], "USD"),
+      da: bestAnnualConcept(facts, ["DepreciationDepletionAndAmortization", "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment", "Depreciation"], "USD")
+    };
 
-export default async function handler(req,res){
-  res.setHeader("Access-Control-Allow-Origin","*");
-  res.setHeader("Access-Control-Allow-Methods","GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers","Content-Type");
-  res.setHeader("Cache-Control","s-maxage=21600, stale-while-revalidate=86400");
-  if(req.method==="OPTIONS")return res.status(204).end();
-  try{
-    let ticker=String((req.query&&req.query.ticker)||"").trim().toUpperCase();
-    if(!ticker)return res.status(400).json({error:"ticker is required"});
-    const requestedTicker=ticker;
-    const map=await tickerMap();
-    let meta=map[ticker];
-    if(!meta&&ticker.includes(".")){ticker=ticker.replace(/\./g,"-");meta=map[ticker];}
-    if(!meta&&ticker.includes("-")){const dotted=ticker.replace(/-/g,".");if(map[dotted]){ticker=dotted;meta=map[ticker];}}
-    if(!meta)return res.status(404).json({error:`Ticker ${requestedTicker} not found in SEC company ticker list`});
-    const cik=String(meta.cik_str).padStart(10,"0");
-    const listedTickers=Object.values(map).filter(x=>String(x.cik_str)===String(meta.cik_str)).map(x=>String(x.ticker).toUpperCase()).sort();
-    const [cf,sub]=await Promise.all([fetchJson(`${SEC_BASE}/api/xbrl/companyfacts/CIK${cik}.json`),fetchJson(`${SEC_BASE}/submissions/CIK${cik}.json`)]);
-    const facts=cf.facts||{}; const dataset=buildDataset(facts,sub,listedTickers);
-    const recent=(sub&&sub.filings&&sub.filings.recent)||{}; const latestFiled=(recent.filingDate&&recent.filingDate[0])||null;
-    return res.status(200).json({
-      ticker,requestedTicker,name:cf.entityName||meta.title||ticker,sector:null,industry:sub&&sub.sicDescription||null,sic:sub&&sub.sic||null,fiscalYearEnd:sub&&sub.fiscalYearEnd||null,
-      financialValuesScale:1,shareValuesScale:1,currentPrice:null,marketCap:null,enterpriseValue:null,pe:null,evEbitda:null,dividendYield:null,
-      ...dataset,sources:sourceUrls(cik),verifiedAsOf:new Date().toISOString().slice(0,10),latestSECFiledDate:latestFiled,
-      dataMethod:"SEC Company Facts deterministic extraction (10-K/10-Q/20-F/40-F/6-K aware)",
-      accuracyNote:"Filed statement values come from SEC XBRL. Unavailable or structurally ambiguous metrics are left blank. Market-cap fallback is disabled for multi-class issuers and approximate share counts."
+    const maps = { revenue: mapByEnd(revenueBest) };
+    Object.keys(concepts).forEach((k) => { maps[k] = mapByEnd(concepts[k]); });
+
+    const historical = annualBase.map((base) => {
+      const end = base.end;
+      const fy = base.fy != null ? Number(base.fy) : Number(end.slice(0, 4));
+      const revenue = valueAt(maps.revenue, end);
+      const op = valueAt(maps.operatingIncome, end);
+      const da = valueAt(maps.da, end);
+      const ocf = valueAt(maps.ocf, end);
+      const capexRaw = valueAt(maps.capex, end);
+      const capex = capexRaw == null ? null : Math.abs(capexRaw);
+      return {
+        year: fy,
+        fiscalYear: fy,
+        fiscalPeriod: base.fp || "FY",
+        periodLabel: `FY ${fy}`,
+        periodType: "FY",
+        periodEnd: end,
+        form: base.form || null,
+        filed: base.filed || null,
+        revenue,
+        grossProfit: valueAt(maps.grossProfit, end),
+        ebitda: op != null && da != null ? op + da : null,
+        operatingIncome: op,
+        netIncome: valueAt(maps.netIncome, end),
+        eps: valueAt(maps.eps, end),
+        operatingCashFlow: ocf,
+        capex,
+        freeCashFlow: ocf != null && capex != null ? ocf - capex : null
+      };
     });
-  }catch(e){return res.status(500).json({error:e&&e.message?e.message:"SEC financials failed"});}
+
+    let currentPeriod = null;
+    const interimRevenue = pickLatestInterim(revenueBest.fact, "USD", latestAnnualEnd);
+    if (interimRevenue) {
+      const r = interimRevenue;
+      const duration = daysBetween(r.start, r.end) || 0;
+      const periodType = duration > 120 ? "YTD" : "QTD";
+      const fy = r.fy != null ? Number(r.fy) : Number(r.end.slice(0, 4));
+      const fp = r.fp ? String(r.fp).toUpperCase() : null;
+
+      function getInterim(best, unit) {
+        if (!best || !best.fact) return null;
+        const rows = getUnitRows(best.fact, unit).filter((x) => x && x.end === r.end && /^(10-Q|10-Q\/A)$/.test(x.form || ""));
+        if (!rows.length) return null;
+        rows.sort((a, b) =>
+          Math.abs((daysBetween(a.start, a.end) || 0) - duration) - Math.abs((daysBetween(b.start, b.end) || 0) - duration) ||
+          String(b.filed || "").localeCompare(String(a.filed || ""))
+        );
+        return itemVal(rows[0]);
+      }
+
+      const revenue = itemVal(r);
+      const gross = getInterim(concepts.grossProfit, "USD");
+      const op = getInterim(concepts.operatingIncome, "USD");
+      const ni = getInterim(concepts.netIncome, "USD");
+      const eps = getInterim(concepts.eps, "USD/shares");
+      const ocf = getInterim(concepts.ocf, "USD");
+      const capexRaw = getInterim(concepts.capex, "USD");
+      const capex = capexRaw == null ? null : Math.abs(capexRaw);
+      const da = getInterim(concepts.da, "USD");
+      let label = `${periodType} through ${r.end}`;
+      if (fp && /^Q[1-4]$/.test(fp)) label = `${fp} FY${fy}${periodType === "YTD" && fp !== "Q1" ? " YTD" : ""}`;
+
+      currentPeriod = {
+        year: fy,
+        fiscalYear: fy,
+        fiscalPeriod: fp,
+        periodLabel: label,
+        periodType,
+        periodEnd: r.end,
+        revenue,
+        grossProfit: gross,
+        ebitda: op != null && da != null ? op + da : null,
+        operatingIncome: op,
+        netIncome: ni,
+        eps,
+        operatingCashFlow: ocf,
+        capex,
+        freeCashFlow: ocf != null && capex != null ? ocf - capex : null
+      };
+    }
+
+    function latestMoney(names) {
+      const best = bestInstantConcept(facts, names, "USD");
+      return best ? itemVal(best.row) : null;
+    }
+
+    const cash = latestMoney(["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "CashAndDueFromBanks"]);
+    const debtCurrent = latestMoney(["LongTermDebtCurrent", "ShortTermBorrowings", "ShortTermDebtCurrent"]);
+    const debtNoncurrent = latestMoney(["LongTermDebtNoncurrent", "LongTermDebtAndFinanceLeaseObligationsNoncurrent", "LongTermDebt"]);
+    const debt = debtCurrent != null || debtNoncurrent != null ? Number(debtCurrent || 0) + Number(debtNoncurrent || 0) : null;
+
+    const sharesBest = bestInstantConcept(facts, ["CommonStockSharesOutstanding"], "shares");
+    let shares = sharesBest ? itemVal(sharesBest.row) : null;
+    let sharesAsOf = sharesBest && sharesBest.row ? sharesBest.row.end : null;
+    let sharesBasis = shares != null ? "SEC shares outstanding" : null;
+
+    // DEI shares fact lives outside us-gaap, so inspect it separately.
+    if (shares == null && facts.dei && facts.dei.EntityCommonStockSharesOutstanding) {
+      const x = latestInstant(facts.dei.EntityCommonStockSharesOutstanding, "shares");
+      shares = itemVal(x);
+      sharesAsOf = x && x.end ? x.end : null;
+      sharesBasis = shares != null ? "SEC cover-page shares outstanding" : null;
+    }
+
+    const profile = classifyProfile(sub);
+    const latest = historical[historical.length - 1] || {};
+    const ratios = {
+      grossMargin: latest.revenue && latest.grossProfit != null ? latest.grossProfit / latest.revenue * 100 : null,
+      operatingMargin: latest.revenue && latest.operatingIncome != null ? latest.operatingIncome / latest.revenue * 100 : null,
+      ebitdaMargin: profile === "financial" ? null : (latest.revenue && latest.ebitda != null ? latest.ebitda / latest.revenue * 100 : null),
+      netMargin: latest.revenue && latest.netIncome != null ? latest.netIncome / latest.revenue * 100 : null,
+      roe: null,
+      roa: null,
+      roic: null,
+      currentRatio: null,
+      debtToEquity: null,
+      interestCoverage: null
+    };
+
+    const sameCikTickers = Object.values(map)
+      .filter((x) => String(x.cik_str) === String(meta.cik_str))
+      .map((x) => String(x.ticker).toUpperCase());
+    const multipleShareClasses = sameCikTickers.length > 1;
+    const checkedValues = countPeriodValues(historical) + (currentPeriod ? countPeriodValues([currentPeriod]) : 0) + (cash != null ? 1 : 0) + (debt != null ? 1 : 0) + (shares != null ? 1 : 0);
+
+    const latestEndAgeDays = latestAnnualEnd ? Math.round((Date.now() - Date.parse(latestAnnualEnd)) / 86400000) : null;
+    const warnings = [];
+    if (latestEndAgeDays != null && latestEndAgeDays > 800) warnings.push(`Latest annual period (${latestAnnualEnd}) appears stale.`);
+    if (historical.length < 4) warnings.push("Fewer than four annual periods were available.");
+    if (multipleShareClasses) warnings.push(`Multiple tickers share this CIK (${sameCikTickers.join(", ")}); price × SEC shares market-cap fallback is disabled.`);
+
+    const recent = (sub && sub.filings && sub.filings.recent) || {};
+    const latestFiled = recent.filingDate && recent.filingDate[0] ? recent.filingDate[0] : null;
+
+    return res.status(200).json({
+      ticker,
+      requestedTicker,
+      name: cf.entityName || meta.title || ticker,
+      sector: null,
+      industry: sub && sub.sicDescription ? sub.sicDescription : null,
+      sic: sub && sub.sic ? sub.sic : null,
+      currency: "USD",
+      profile,
+      fiscalYearEnd: sub && sub.fiscalYearEnd ? sub.fiscalYearEnd : null,
+      financialValuesScale: 1,
+      shareValuesScale: 1,
+      currentPrice: null,
+      marketCap: null,
+      enterpriseValue: null,
+      pe: null,
+      evEbitda: null,
+      dividendYield: null,
+      cash,
+      debt,
+      shares,
+      sharesAsOf,
+      sharesBasis,
+      sharesApproximate: false,
+      listedTickers: sameCikTickers,
+      multipleShareClasses,
+      marketCapDerivationAllowed: !multipleShareClasses && shares != null,
+      evMetricsMeaningful: profile !== "financial",
+      dcfComparableToQuote: !multipleShareClasses,
+      historical,
+      currentPeriod,
+      ratios,
+      validation: {
+        status: warnings.length ? "WARN" : "PASS",
+        warnings,
+        checkedValues
+      },
+      selectedConcepts: {
+        revenue: revenueBest.name,
+        revenueLatestEnd: revenueBest.latest
+      },
+      sources: sourceUrls(cik),
+      verifiedAsOf: new Date().toISOString().slice(0, 10),
+      latestSECFiledDate: latestFiled,
+      dataMethod: "SEC Company Facts stable U.S.-issuer extraction",
+      metricNotes: profile === "financial" ? "Financial-institution profile: EV/EBITDA is intentionally de-emphasized." : "Standard corporate profile"
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e && e.message ? e.message : "SEC financials failed" });
+  }
+}
