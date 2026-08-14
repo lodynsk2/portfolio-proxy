@@ -179,6 +179,15 @@ function sourceUrls(cik) {
 }
 
 export default async function handler(req,res) {
+  // Allow the Portfolio Manager frontend (a different Vercel domain) to call this endpoint.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Cache-Control", "s-maxage=3600, stale-while-revalidate=86400");
+
+  // Browsers may send a CORS preflight request.
+  if (req.method === "OPTIONS") return res.status(204).end();
+
   try {
     const ticker=String((req.query&&req.query.ticker)||"").trim().toUpperCase();
     if(!ticker) return res.status(400).json({error:"ticker is required"});
