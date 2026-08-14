@@ -93,6 +93,15 @@ function candidateFacts(facts,names){
   }
   return out;
 }
+function isBetterAnnualCandidate(candidate,best){
+  if(!best)return true;
+  // RECENCY FIRST.  A legacy tag with 15 years of history must never beat a
+  // current tag merely because it has more rows (this was the Apple 2017 bug).
+  if(candidate.latest!==best.latest)return candidate.latest>best.latest;
+  if(candidate.rows.length!==best.rows.length)return candidate.rows.length>best.rows.length;
+  // Prefer the order supplied in `names` / taxonomy iteration only as a final tie-break.
+  return false;
+}
 function bestAnnualFact(facts,names,type="money",preferredCurrency=null){
   let best=null;
   for(const c of candidateFacts(facts,names)){
@@ -101,8 +110,8 @@ function bestAnnualFact(facts,names,type="money",preferredCurrency=null){
     const rows=annualRows(c.fact,unit);
     if(!rows.length)continue;
     const latest=rows[rows.length-1].end||"";
-    const score=rows.length*100000000 + Number(String(latest).replace(/-/g,""));
-    if(!best||score>best.score)best={...c,unit,rows,score};
+    const candidate={...c,unit,rows,latest};
+    if(isBetterAnnualCandidate(candidate,best))best=candidate;
   }
   return best;
 }
@@ -111,9 +120,10 @@ function bestFactForUnit(facts,names,unit){
   for(const c of candidateFacts(facts,names)){
     if(!unitKeys(c.fact).includes(unit))continue;
     const rows=annualRows(c.fact,unit);
-    const latest=rows.length?(rows[rows.length-1].end||""):"";
-    const score=rows.length*100000000+Number(String(latest).replace(/-/g,""));
-    if(!best||score>best.score)best={...c,unit,rows,score};
+    if(!rows.length)continue;
+    const latest=rows[rows.length-1].end||"";
+    const candidate={...c,unit,rows,latest};
+    if(isBetterAnnualCandidate(candidate,best))best=candidate;
   }
   return best;
 }
@@ -269,6 +279,7 @@ function buildDataset(facts,sub,listedTickers){
 
   return {
     historical,currentPeriod,currency,profile,ratios,cash,marketableSecurities,liquidAssets,debt,shares,sharesAsOf,sharesBasis,sharesApproximate,multipleShareClasses,listedTickers,
+    selectedConcepts:{revenue:revenueBest.name,revenueTaxonomy:revenueBest.taxonomy,revenueLatestEnd:revenueBest.latest},
     marketCapDerivationAllowed:currency==="USD"&&!multipleShareClasses&&!sharesApproximate&&shares!=null,
     evMetricsMeaningful:profile!=="financial",
     dcfComparableToQuote:currency==="USD"&&!multipleShareClasses,
@@ -305,4 +316,3 @@ export default async function handler(req,res){
       accuracyNote:"Filed statement values come from SEC XBRL. Unavailable or structurally ambiguous metrics are left blank. Market-cap fallback is disabled for multi-class issuers and approximate share counts."
     });
   }catch(e){return res.status(500).json({error:e&&e.message?e.message:"SEC financials failed"});}
-}
