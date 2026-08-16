@@ -15,7 +15,7 @@ function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Cache-Control", "s-maxage=21600, stale-while-revalidate=86400");
+  res.setHeader("Cache-Control", "s-maxage=43200, stale-while-revalidate=86400");
 }
 
 function sleep(ms) {
@@ -244,7 +244,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ticker,
-      basis: "Alpha Vantage reported EPS / analyst estimate basis",
+      basis: "Reported EPS vs analyst estimate (Alpha Vantage)",
       nextEarningsDate,
       nextEarningsConfirmed: false,
       nextEstimate,
@@ -265,7 +265,9 @@ export default async function handler(req, res) {
         }
       ],
       provider: "Alpha Vantage",
-      verificationStatus: "DIRECT DATA PROVIDER",
+      verificationStatus: "PROVIDER-SOURCED",
+      sourceMethod: "Alpha Vantage EARNINGS history; optional EARNINGS_CALENDAR for upcoming consensus/date",
+      providerLimitNote: "Availability and rate limits depend on the connected Alpha Vantage plan; calendar failure does not suppress historical earnings history.",
       calendarWarning
     });
   } catch (e) {
