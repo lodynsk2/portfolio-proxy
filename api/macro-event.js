@@ -131,10 +131,13 @@ export default async function handler(req,res) {
       try{
         const te=await tradingEconomics(date,cfg);
         if(te){
-          if(te.actual!=null)actual=te.actual;
-          if(te.previous!=null)previous=te.previous;
+          // Official FRED/ALFRED values remain the primary actual/previous source.
+          // Trading Economics is used for consensus fields, and only fills an
+          // actual/previous value when no official FRED series is configured.
+          if(!cfg.series && te.actual!=null) actual=te.actual;
+          if(!cfg.series && te.previous!=null) previous=te.previous;
           forecast=te.forecast;
-          surprise=te.surprisePct;
+          surprise=forecast!=null && actual!=null ? surprisePct(actual,forecast) : null;
           previousSurprise=te.previousSurprisePct;
           consensusSource=te.consensusSource;
         }
@@ -145,9 +148,10 @@ export default async function handler(req,res) {
       releaseId,date,actual,forecast,previous,
       surprisePct:surprise,
       previousSurprisePct:previousSurprise,
-      valueSource: cfg.series ? "FRED/ALFRED" : null,
+      valueSource: cfg.series ? "FRED/ALFRED vintage" : (actual!=null ? "Trading Economics" : null),
       consensusSource,
       consensusEnabled:Boolean(TE_API_KEY),
+      surpriseMethod:"Relative difference: (actual - consensus) / abs(consensus). This is a dashboard convention, not an official agency statistic.",
       warning:valueWarning||null
     });
   }catch(e){return res.status(500).json({error:e&&e.message?e.message:"Macro event lookup failed"});}
