@@ -66,6 +66,16 @@ function annualRows(fact, unit) {
   return [...byEnd.values()].sort((a, b) => String(a.end).localeCompare(String(b.end)));
 }
 
+function annualInstantRows(fact, unit) {
+  const byEnd = new Map();
+  for (const x of getUnitRows(fact, unit)) {
+    if (!x || !x.end || !/^(10-K|10-K\/A)$/.test(x.form || "")) continue;
+    const prev = byEnd.get(x.end);
+    if (!prev || String(x.filed || "") > String(prev.filed || "")) byEnd.set(x.end, x);
+  }
+  return [...byEnd.values()].sort((a,b)=>String(a.end).localeCompare(String(b.end)));
+}
+
 function latestInstant(fact, unit) {
   const rows = getUnitRows(fact, unit).filter((x) =>
     x && x.end && /^(10-K|10-K\/A|10-Q|10-Q\/A)$/.test(x.form || "")
@@ -105,6 +115,19 @@ function bestAnnualConcept(facts, names, unit) {
   return best;
 }
 
+function bestAnnualInstantConcept(facts, names, unit) {
+  let best = null;
+  for (const c of factCandidates(facts, names)) {
+    const rows = annualInstantRows(c.fact, unit);
+    if (!rows.length) continue;
+    const latest = rows[rows.length - 1].end || "";
+    if (!best || latest > best.latest || (latest === best.latest && rows.length > best.rows.length)) {
+      best = { name:c.name, fact:c.fact, rows, latest };
+    }
+  }
+  return best;
+}
+
 function bestInstantConcept(facts, names, unit) {
   let best = null;
   for (const c of factCandidates(facts, names)) {
@@ -139,11 +162,15 @@ function pickLatestInterim(fact, unit, afterAnnualEnd) {
   if (!rows.length) return null;
   const newestEnd = rows.map((x) => x.end).sort().slice(-1)[0];
   const same = rows.filter((x) => x.end === newestEnd);
+  // Prefer the longest duration for the latest end date. This makes Q2/Q3
+  // a YTD statement period when the filing supplies both quarter-only and YTD
+  // facts, which also aligns operating cash flow and CapEx on a consistent basis.
+  // For equal durations, prefer the latest filed fact.
   same.sort((a, b) =>
-    (daysBetween(a.start, a.end) || 0) - (daysBetween(b.start, b.end) || 0) ||
-    String(a.filed || "").localeCompare(String(b.filed || ""))
+    (daysBetween(b.start, b.end) || 0) - (daysBetween(a.start, a.end) || 0) ||
+    String(b.filed || "").localeCompare(String(a.filed || ""))
   );
-  return same[same.length - 1] || null;
+  return same[0] || null;
 }
 
 function classifyProfile(sub) {
@@ -189,6 +216,14 @@ export default async function handler(req, res) {
       fetchJson(`${SEC_BASE}/submissions/CIK${cik}.json`)
     ]);
     const facts = cf.facts || {};
+    const recentForms = (sub && sub.filings && sub.filings.recent && sub.filings.recent.form) || [];
+    const hasDomesticAnnual = recentForms.some((f) => /^(10-K|10-K\/A)$/.test(String(f || "")));
+    const hasForeignAnnual = recentForms.some((f) => /^(20-F|20-F\/A|40-F|40-F\/A)$/.test(String(f || "")));
+    if (!hasDomesticAnnual && hasForeignAnnual) {
+      return res.status(422).json({
+        error: "Foreign private issuer detected. This audited endpoint currently supports U.S.-GAAP 10-K/10-Q filers; 20-F/40-F issuers are intentionally withheld rather than mapped unreliably."
+      });
+    }
 
     const revenueBest = bestAnnualConcept(facts, [
       "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -210,7 +245,8 @@ export default async function handler(req, res) {
       eps: bestAnnualConcept(facts, ["EarningsPerShareDiluted"], "USD/shares"),
       ocf: bestAnnualConcept(facts, ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"], "USD"),
       capex: bestAnnualConcept(facts, ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsForAdditionsToPropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"], "USD"),
-      da: bestAnnualConcept(facts, ["DepreciationDepletionAndAmortization", "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment", "Depreciation"], "USD")
+      da: bestAnnualConcept(facts, ["DepreciationDepletionAndAmortization", "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment", "Depreciation"], "USD"),
+      interestExpense: bestAnnualConcept(facts, ["InterestExpenseNonOperating", "InterestAndDebtExpense"], "USD")
     };
 
     const maps = { revenue: mapByEnd(revenueBest) };
@@ -218,7 +254,7 @@ export default async function handler(req, res) {
 
     const historical = annualBase.map((base) => {
       const end = base.end;
-      const fy = base.fy != null ? Number(base.fy) : Number(end.slice(0, 4));
+      const fy = base.fy != null && Number.isFinite(Number(base.fy)) ? Number(base.fy) : Number(end.slice(0, 4));
       const revenue = valueAt(maps.revenue, end);
       const op = valueAt(maps.operatingIncome, end);
       const da = valueAt(maps.da, end);
@@ -242,7 +278,8 @@ export default async function handler(req, res) {
         eps: valueAt(maps.eps, end),
         operatingCashFlow: ocf,
         capex,
-        freeCashFlow: ocf != null && capex != null ? ocf - capex : null
+        freeCashFlow: ocf != null && capex != null ? ocf - capex : null,
+        interestExpense: valueAt(maps.interestExpense, end)
       };
     });
 
@@ -302,10 +339,25 @@ export default async function handler(req, res) {
       return best ? itemVal(best.row) : null;
     }
 
-    const cash = latestMoney(["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "CashAndDueFromBanks"]);
-    const debtCurrent = latestMoney(["LongTermDebtCurrent", "ShortTermBorrowings", "ShortTermDebtCurrent"]);
-    const debtNoncurrent = latestMoney(["LongTermDebtNoncurrent", "LongTermDebtAndFinanceLeaseObligationsNoncurrent", "LongTermDebt"]);
-    const debt = debtCurrent != null || debtNoncurrent != null ? Number(debtCurrent || 0) + Number(debtNoncurrent || 0) : null;
+    const cashBest = bestInstantConcept(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "CashAndDueFromBanks"], "USD");
+    const cash = cashBest ? itemVal(cashBest.row) : null;
+    const cashBasis = cashBest ? cashBest.name : null;
+
+    // Interest-bearing debt proxy. Prefer a filed total long-term-debt concept;
+    // otherwise combine current + noncurrent long-term debt. Short-term
+    // borrowings/commercial paper are added separately. We intentionally do
+    // not mix generic liabilities into EV.
+    const totalLongTermDebt = latestMoney(["LongTermDebtAndFinanceLeaseObligations", "LongTermDebt"]);
+    const longTermCurrent = latestMoney(["LongTermDebtAndFinanceLeaseObligationsCurrent", "LongTermDebtCurrent"]);
+    const longTermNoncurrent = latestMoney(["LongTermDebtAndFinanceLeaseObligationsNoncurrent", "LongTermDebtNoncurrent"]);
+    const shortTermBorrowings = latestMoney(["ShortTermBorrowings", "CommercialPaper"]);
+    let longTermDebt = totalLongTermDebt;
+    if (longTermDebt == null && (longTermCurrent != null || longTermNoncurrent != null)) {
+      longTermDebt = Number(longTermCurrent || 0) + Number(longTermNoncurrent || 0);
+    }
+    const debt = longTermDebt != null || shortTermBorrowings != null
+      ? Number(longTermDebt || 0) + Number(shortTermBorrowings || 0)
+      : null;
 
     const sharesBest = bestInstantConcept(facts, ["CommonStockSharesOutstanding"], "shares");
     let shares = sharesBest ? itemVal(sharesBest.row) : null;
@@ -320,19 +372,37 @@ export default async function handler(req, res) {
       sharesBasis = shares != null ? "SEC cover-page shares outstanding" : null;
     }
 
+    const assetsCurrent = latestMoney(["AssetsCurrent"]);
+    const liabilitiesCurrent = latestMoney(["LiabilitiesCurrent"]);
+    const equityLatest = latestMoney(["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]);
+    const assetsLatest = latestMoney(["Assets"]);
+
+    const annualAssetsBest = bestAnnualInstantConcept(facts, ["Assets"], "USD");
+    const annualEquityBest = bestAnnualInstantConcept(facts, ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"], "USD");
+    const annualAssetsMap = new Map((annualAssetsBest&&annualAssetsBest.rows||[]).map(x=>[x.end,x]));
+    const annualEquityMap = new Map((annualEquityBest&&annualEquityBest.rows||[]).map(x=>[x.end,x]));
+
     const profile = classifyProfile(sub);
     const latest = historical[historical.length - 1] || {};
+    const prior = historical.length>1 ? historical[historical.length-2] : null;
+    const latestAssetsAnnual = latest&&latest.periodEnd ? itemVal(annualAssetsMap.get(latest.periodEnd)) : null;
+    const priorAssetsAnnual = prior&&prior.periodEnd ? itemVal(annualAssetsMap.get(prior.periodEnd)) : null;
+    const latestEquityAnnual = latest&&latest.periodEnd ? itemVal(annualEquityMap.get(latest.periodEnd)) : null;
+    const priorEquityAnnual = prior&&prior.periodEnd ? itemVal(annualEquityMap.get(prior.periodEnd)) : null;
+    const avgAssets = latestAssetsAnnual!=null&&priorAssetsAnnual!=null ? (latestAssetsAnnual+priorAssetsAnnual)/2 : null;
+    const avgEquity = latestEquityAnnual!=null&&priorEquityAnnual!=null ? (latestEquityAnnual+priorEquityAnnual)/2 : null;
+    const latestInterest = latest&&latest.interestExpense!=null ? Math.abs(Number(latest.interestExpense)) : null;
     const ratios = {
       grossMargin: latest.revenue && latest.grossProfit != null ? latest.grossProfit / latest.revenue * 100 : null,
       operatingMargin: latest.revenue && latest.operatingIncome != null ? latest.operatingIncome / latest.revenue * 100 : null,
       ebitdaMargin: profile === "financial" ? null : (latest.revenue && latest.ebitda != null ? latest.ebitda / latest.revenue * 100 : null),
       netMargin: latest.revenue && latest.netIncome != null ? latest.netIncome / latest.revenue * 100 : null,
-      roe: null,
-      roa: null,
+      roe: latest.netIncome!=null && avgEquity>0 ? latest.netIncome / avgEquity * 100 : null,
+      roa: latest.netIncome!=null && avgAssets>0 ? latest.netIncome / avgAssets * 100 : null,
       roic: null,
-      currentRatio: null,
-      debtToEquity: null,
-      interestCoverage: null
+      currentRatio: profile === "financial" ? null : (assetsCurrent!=null && liabilitiesCurrent>0 ? assetsCurrent / liabilitiesCurrent : null),
+      debtToEquity: profile === "financial" ? null : (debt!=null && equityLatest>0 ? debt / equityLatest : null),
+      interestCoverage: profile === "financial" ? null : (latest.operatingIncome!=null && latestInterest>0 ? latest.operatingIncome / latestInterest : null)
     };
 
     const sameCikTickers = Object.values(map)
@@ -343,9 +413,12 @@ export default async function handler(req, res) {
 
     const latestEndAgeDays = latestAnnualEnd ? Math.round((Date.now() - Date.parse(latestAnnualEnd)) / 86400000) : null;
     const warnings = [];
-    if (latestEndAgeDays != null && latestEndAgeDays > 800) warnings.push(`Latest annual period (${latestAnnualEnd}) appears stale.`);
+    if (latestEndAgeDays != null && latestEndAgeDays > 550) warnings.push(`Latest annual period (${latestAnnualEnd}) appears stale.`);
     if (historical.length < 4) warnings.push("Fewer than four annual periods were available.");
     if (multipleShareClasses) warnings.push(`Multiple tickers share this CIK (${sameCikTickers.join(", ")}); price × SEC shares market-cap fallback is disabled.`);
+    const sharesAgeDays = sharesAsOf ? Math.round((Date.now() - Date.parse(sharesAsOf)) / 86400000) : null;
+    const sharesRecentEnough = shares != null && (sharesAgeDays == null || sharesAgeDays <= 550);
+    if (shares != null && !sharesRecentEnough) warnings.push(`Shares-outstanding fact is stale (${sharesAsOf}); price × shares market-cap fallback is disabled.`);
 
     const recent = (sub && sub.filings && sub.filings.recent) || {};
     const latestFiled = recent.filingDate && recent.filingDate[0] ? recent.filingDate[0] : null;
@@ -369,16 +442,22 @@ export default async function handler(req, res) {
       evEbitda: null,
       dividendYield: null,
       cash,
+      cashBasis,
       debt,
+      debtBasis: debt == null ? null : "SEC interest-bearing debt proxy (long-term debt plus short-term borrowings when separately available)",
+      assets: assetsLatest,
+      equity: equityLatest,
+      currentAssets: assetsCurrent,
+      currentLiabilities: liabilitiesCurrent,
       shares,
       sharesAsOf,
       sharesBasis,
       sharesApproximate: false,
       listedTickers: sameCikTickers,
       multipleShareClasses,
-      marketCapDerivationAllowed: !multipleShareClasses && shares != null,
+      marketCapDerivationAllowed: !multipleShareClasses && sharesRecentEnough,
       evMetricsMeaningful: profile !== "financial",
-      dcfComparableToQuote: !multipleShareClasses,
+      dcfComparableToQuote: !multipleShareClasses && sharesRecentEnough,
       historical,
       currentPeriod,
       ratios,
@@ -393,9 +472,13 @@ export default async function handler(req, res) {
       },
       sources: sourceUrls(cik),
       verifiedAsOf: new Date().toISOString().slice(0, 10),
+      retrievedAsOf: new Date().toISOString(),
       latestSECFiledDate: latestFiled,
-      dataMethod: "SEC Company Facts stable U.S.-issuer extraction",
-      metricNotes: profile === "financial" ? "Financial-institution profile: EV/EBITDA is intentionally de-emphasized." : "Standard corporate profile"
+      dataMethod: "SEC Company Facts deterministic U.S.-issuer extraction",
+      scope: "U.S. domestic 10-K/10-Q filers using US-GAAP XBRL",
+      unsupportedIssuerPolicy: "Foreign private issuers and unsupported taxonomies are withheld rather than approximated.",
+      ebitdaBasis: "Derived proxy = operating income + depreciation/depletion/amortization when both are available from SEC XBRL; not necessarily company-reported adjusted EBITDA.",
+      metricNotes: profile === "financial" ? "Financial-institution profile: generic EV/EBITDA, current ratio, debt/equity and interest-coverage comparisons are intentionally withheld; gross-profit/EBITDA concepts may also be unavailable." : "Standard corporate profile; EBITDA is a filing-derived proxy when available, ROE/ROA use average beginning/end annual balance-sheet denominators and remain blank when the prior annual denominator is unavailable; ROIC is left blank unless a defensible invested-capital definition is available, and debt is an interest-bearing-debt proxy rather than total liabilities."
     });
   } catch (e) {
     return res.status(500).json({ error: e && e.message ? e.message : "SEC financials failed" });
