@@ -1,3 +1,5 @@
+import { upstreamFetch, upstreamJson, finite, fredRows, noStoreErrors } from "../lib/upstream.js";
+
 // Vercel Serverless Function: /api/macro-event?releaseId=180&date=2026-08-06
 // Loads ONE event's values on demand, so the monthly calendar stays fast.
 // Actual/Previous: FRED/ALFRED. Optional consensus: Trading Economics.
@@ -5,8 +7,8 @@
 // Optional: TRADING_ECONOMICS_API_KEY
 
 const FRED_BASE = "https://api.stlouisfed.org/fred";
-const FRED_API_KEY = process.env.FRED_API_KEY || process.env.FRED_KEY || process.env.FRED_APIKEY || "";
-const TE_API_KEY = process.env.TRADING_ECONOMICS_API_KEY || process.env.TE_API_KEY || "";
+const FRED_API_KEY =( process.env.FRED_API_KEY || process.env.FRED_KEY || process.env.FRED_APIKEY || "").trim();
+const TE_API_KEY =( process.env.TRADING_ECONOMICS_API_KEY || process.env.TE_API_KEY || "").trim();
 
 const CONFIG = {
   10:  { series:"CPIAUCSL", transform:"pct", decimals:1, suffix:"%", te:["inflation rate mom","cpi mom"] },
@@ -28,7 +30,7 @@ function cors(res) {
   res.setHeader("Cache-Control", "s-maxage=21600, stale-while-revalidate=86400");
 }
 
-function validDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s||"")); }
+function validDate(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s||"")) && Number.isFinite(Date.parse(s+"T00:00:00Z")) && iso(new Date(s+"T00:00:00Z"))===s; }
 function iso(d) { return d.toISOString().slice(0,10); }
 function addDays(s,n) { const d=new Date(s+"T12:00:00Z"); d.setUTCDate(d.getUTCDate()+n); return iso(d); }
 
@@ -47,13 +49,8 @@ async function fredObservations(series, releaseDate, historical) {
     sort_order: "asc"
   });
 
-  const r = await fetch(`${FRED_BASE}/series/observations?${qs.toString()}`);
-  const body = await r.json().catch(()=>({}));
-  if (!r.ok || body.error_code) throw new Error(body.error_message || `FRED observations HTTP ${r.status}`);
-
-  return (Array.isArray(body.observations)?body.observations:[])
-    .map(x=>({date:x.date,value:x.value==="."?null:Number(x.value)}))
-    .filter(x=>x.date&&Number.isFinite(x.value));
+  const body = await upstreamJson(`${FRED_BASE}/series/observations?${qs.toString()}`, {}, "FRED/ALFRED");
+  return fredRows(body,series).sort((a,b)=>a.date.localeCompare(b.date));
 }
 
 function transformed(rows, cfg, idx) {
@@ -88,8 +85,8 @@ async function tradingEconomics(date,cfg) {
   if (!TE_API_KEY) return null;
   const start=addDays(date,-100), end=addDays(date,1);
   const url=`https://api.tradingeconomics.com/calendar/country/united%20states/${start}/${end}?c=${encodeURIComponent(TE_API_KEY)}&values=true&f=json`;
-  const r=await fetch(url); const body=await r.json().catch(()=>[]);
-  if(!r.ok||!Array.isArray(body)) throw new Error((body&&body.Message)||`Trading Economics HTTP ${r.status}`);
+  const body=await upstreamJson(url,{},"Trading Economics");
+  if(!Array.isArray(body)) throw new Error("Trading Economics returned an invalid calendar");
 
   const same=body.filter(x=>String(x.Date||"").slice(0,10)===date).map(x=>({row:x,s:score(x,cfg)})).filter(x=>x.s>0).sort((a,b)=>b.s-a.s);
   const current=same.length?same[0].row:null;
@@ -104,6 +101,7 @@ async function tradingEconomics(date,cfg) {
 }
 
 export default async function handler(req,res) {
+  noStoreErrors(res);
   cors(res);
   if(req.method==="OPTIONS")return res.status(204).end();
   if(req.method!=="GET")return res.status(405).json({error:"GET only"});
@@ -121,7 +119,7 @@ export default async function handler(req,res) {
       try{
         const rows=await fredObservations(cfg.series,date,historical);
         const i=rows.length-1;
-        if(historical){ actual=format(transformed(rows,cfg,i),cfg); previous=format(transformed(rows,cfg,i-1),cfg); }
+        if(date <= new Date().toISOString().slice(0,10)){ actual=format(transformed(rows,cfg,i),cfg); previous=format(transformed(rows,cfg,i-1),cfg); }
         else { previous=format(transformed(rows,cfg,i),cfg); }
       }catch(e){ valueWarning=e&&e.message?e.message:"FRED values unavailable"; }
     }
@@ -144,11 +142,12 @@ export default async function handler(req,res) {
       }catch(e){ valueWarning=[valueWarning,e&&e.message].filter(Boolean).join(" · "); }
     }
 
+    if(valueWarning)res.setHeader("Cache-Control","no-store");
     return res.status(200).json({
       releaseId,date,actual,forecast,previous,
       surprisePct:surprise,
       previousSurprisePct:previousSurprise,
-      valueSource: cfg.series ? "FRED/ALFRED vintage" : (actual!=null ? "Trading Economics" : null),
+      valueSource: cfg.series ? (actual!=null || previous!=null ? "FRED/ALFRED vintage" : null) : (actual!=null ? "Trading Economics" : null),
       consensusSource,
       consensusEnabled:Boolean(TE_API_KEY),
       surpriseMethod:"Relative difference: (actual - consensus) / abs(consensus). This is a dashboard convention, not an official agency statistic.",
