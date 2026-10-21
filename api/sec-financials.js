@@ -1,3 +1,5 @@
+import { upstreamFetch, upstreamJson, finite, fredRows, noStoreErrors } from "../lib/upstream.js";
+
 // Stable SEC Financials endpoint for Vercel
 // Save as: /api/sec-financials.js
 // Primary target: U.S. domestic SEC filers using 10-K / 10-Q and US-GAAP XBRL.
@@ -26,9 +28,7 @@ function secHeaders() {
 }
 
 async function fetchJson(url) {
-  const r = await fetch(url, { headers: secHeaders() });
-  if (!r.ok) throw new Error(`SEC request failed ${r.status}: ${url}`);
-  return r.json();
+  return upstreamJson(url, { headers: secHeaders() }, "SEC (check SEC_CONTACT if denied)");
 }
 
 async function tickerMap() {
@@ -38,6 +38,7 @@ async function tickerMap() {
   Object.values(raw || {}).forEach((x) => {
     if (x && x.ticker) map[String(x.ticker).toUpperCase()] = x;
   });
+  if (!Object.keys(map).length) throw new Error("SEC returned an empty ticker list; check SEC_CONTACT and upstream access");
   tickerCache = map;
   tickerCacheAt = Date.now();
   return map;
@@ -88,7 +89,7 @@ function latestInstant(fact, unit) {
 }
 
 function itemVal(x) {
-  return x && Number.isFinite(Number(x.val)) ? Number(x.val) : null;
+  return x ? finite(x.val) : null;
 }
 
 function factCandidates(facts, names) {
@@ -193,6 +194,7 @@ function countPeriodValues(periods) {
 }
 
 export default async function handler(req, res) {
+  noStoreErrors(res);
   cors(res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET") return res.status(405).json({ error: "GET only" });
@@ -215,7 +217,8 @@ export default async function handler(req, res) {
       fetchJson(`${SEC_BASE}/api/xbrl/companyfacts/CIK${cik}.json`),
       fetchJson(`${SEC_BASE}/submissions/CIK${cik}.json`)
     ]);
-    const facts = cf.facts || {};
+    if (!cf.facts || !sub.filings) throw new Error("SEC company facts or submissions response is incomplete");
+    const facts = cf.facts;
     const recentForms = (sub && sub.filings && sub.filings.recent && sub.filings.recent.form) || [];
     const hasDomesticAnnual = recentForms.some((f) => /^(10-K|10-K\/A)$/.test(String(f || "")));
     const hasForeignAnnual = recentForms.some((f) => /^(20-F|20-F\/A|40-F|40-F\/A)$/.test(String(f || "")));
