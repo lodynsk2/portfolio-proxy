@@ -1,9 +1,11 @@
+import { upstreamFetch, upstreamJson, finite, fredRows, noStoreErrors } from "../lib/upstream.js";
+
 // Vercel Serverless Function: /api/earnings?ticker=NVDA
 // Alpha Vantage version with free-tier-safe request pacing.
 // Required Vercel env var: ALPHA_VANTAGE_API_KEY
 
 const BASE = "https://www.alphavantage.co/query";
-const API_KEY = process.env.ALPHA_VANTAGE_API_KEY || "";
+const API_KEY =( process.env.ALPHA_VANTAGE_API_KEY || "").trim();
 
 // Warm-instance queue so this function does not fire multiple Alpha Vantage
 // requests at the same time. This is especially useful on the free tier.
@@ -99,9 +101,8 @@ function queuedAlphaRequest(task) {
   const run = avQueue.then(async () => {
     const wait = Math.max(0, MIN_GAP_MS - (Date.now() - lastAvRequestAt));
     if (wait > 0) await sleep(wait);
-    const result = await task();
     lastAvRequestAt = Date.now();
-    return result;
+    try { return await task(); } finally { lastAvRequestAt = Date.now(); }
   });
 
   avQueue = run.catch(() => {});
@@ -110,10 +111,7 @@ function queuedAlphaRequest(task) {
 
 async function alphaJson(url) {
   return queuedAlphaRequest(async () => {
-    const r = await fetch(url);
-    const body = await r.json().catch(() => ({}));
-
-    if (!r.ok) throw new Error(`Alpha Vantage HTTP ${r.status}`);
+    const body = await upstreamJson(url, {}, "Alpha Vantage");
 
     const msg = providerMessage(body);
     if (msg) throw new Error(msg);
@@ -124,8 +122,8 @@ async function alphaJson(url) {
 
 async function alphaText(url) {
   return queuedAlphaRequest(async () => {
-    const r = await fetch(url);
-    const text = await r.text();
+    const r = await upstreamFetch(url);
+    const text = r.text;
 
     if (!r.ok) throw new Error(`Alpha Vantage calendar HTTP ${r.status}`);
 
@@ -141,6 +139,7 @@ async function alphaText(url) {
 }
 
 export default async function handler(req, res) {
+  noStoreErrors(res);
   cors(res);
 
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -242,6 +241,7 @@ export default async function handler(req, res) {
       });
     }
 
+    if (calendarWarning) res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ticker,
       basis: "Reported EPS vs analyst estimate (Alpha Vantage)",
