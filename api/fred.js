@@ -1,9 +1,11 @@
+import { upstreamFetch, upstreamJson, finite, fredRows, noStoreErrors } from "../lib/upstream.js";
+
 // Audited FRED endpoint for Vercel: /api/fred
 // Required env var: FRED_API_KEY
 // Returns transparent, transformed macro series used by the Portfolio Manager.
 
 const BASE = "https://api.stlouisfed.org/fred/series/observations";
-const KEY = process.env.FRED_API_KEY || process.env.FRED_KEY || process.env.FRED_APIKEY || "";
+const KEY =( process.env.FRED_API_KEY || process.env.FRED_KEY || process.env.FRED_APIKEY || "").trim();
 
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -24,12 +26,8 @@ async function obs(seriesId, options = {}) {
   if (options.units) qs.set("units", options.units);
   if (options.frequency) qs.set("frequency", options.frequency);
   if (options.aggregation_method) qs.set("aggregation_method", options.aggregation_method);
-  const r = await fetch(`${BASE}?${qs.toString()}`);
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok || j.error_code) throw new Error(j.error_message || `${seriesId} HTTP ${r.status}`);
-  return (Array.isArray(j.observations) ? j.observations : [])
-    .map(x => ({ date: x.date, value: x.value === "." ? null : Number(x.value) }))
-    .filter(x => x.date && Number.isFinite(x.value));
+  const body = await upstreamJson(`${BASE}?${qs.toString()}`, {}, `FRED ${seriesId}`);
+  return fredRows(body, seriesId).sort((a,b) => b.date.localeCompare(a.date));
 }
 
 function latest(rows, i = 0) {
@@ -50,11 +48,13 @@ function str(v, d = 2) {
 }
 
 export default async function handler(req, res) {
+  noStoreErrors(res);
   cors(res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET") return res.status(405).json({ error: "GET only" });
 
   try {
+    if (!KEY) return res.status(503).json({error:"Missing FRED_API_KEY in the proxy project's Vercel Production environment. Add it and redeploy the proxy."});
     const specs = {
       GDP: ["A191RL1Q225SBEA", {}],              // Real GDP q/q annualized %
       CPI: ["CPIAUCSL", { units: "pc1", limit: 14 }], // CPI % change from year ago
@@ -84,6 +84,10 @@ export default async function handler(req, res) {
       else { data[k] = []; warnings.push(`${k}: ${r.reason && r.reason.message ? r.reason.message : "unavailable"}`); }
     });
 
+    if (!Object.values(data).some(rows => rows.length)) return res.status(502).json({
+      error:"FRED returned no usable observations. Check the API key and upstream response.", _warnings:warnings
+    });
+    if (warnings.length) res.setHeader("Cache-Control", "no-store");
     const gdp = latest(data.GDP), gdpPrev = latest(data.GDP, 1);
     const cpi = latest(data.CPI), cpiPrev = latest(data.CPI, 1);
     const coreCpi = latest(data.CORE_CPI), coreCpiPrev = latest(data.CORE_CPI, 1);
